@@ -1,0 +1,197 @@
+# ============================================
+# PRÁCTICA IoT — Wokwi → MQTT → Kafka → Spark → MinIO
+# Infraestructura completa en Docker
+# ============================================
+#
+# Flujo:
+#   Wokwi (ESP32+DHT22, en el navegador) → HiveMQ (broker MQTT público)
+#     → bridge (suscriptor MQTT → productor Kafka)
+#     → Kafka (topic iot-sensor)
+#     → Spark Structured Streaming
+#     → MinIO (bucket raw-data, Parquet)
+
+services:
+  # ==========================================
+  # KAFKA - modo KRaft (sin Zookeeper)
+  # Imagen oficial Apache, como en el material del curso
+  # ==========================================
+  kafka:
+    image: apache/kafka:4.1.1
+    container_name: iot-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # Listeners: interno (kafka:9092), controller (9093) y externo (localhost:29092)
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports:
+      - "${KAFKA_PORT:-29092}:29092"
+    networks:
+      - iot-network
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 8
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  # ==========================================
+  # KAFKA INIT - crea el topic explícitamente
+  # (3 particiones; no dependemos del auto-create)
+  # ==========================================
+  kafka-init:
+    image: apache/kafka:4.1.1
+    container_name: iot-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092
+      --create --if-not-exists --topic ${KAFKA_TOPIC:-iot-sensor}
+      --partitions 3 --replication-factor 1;
+      echo '✅ Topic ${KAFKA_TOPIC:-iot-sensor} listo';
+      "
+    networks:
+      - iot-network
+
+  # ==========================================
+  # KAFKA UI - interfaz visual
+  # ==========================================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: iot-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: iot-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    ports:
+      - "${KAFKA_UI_PORT:-8080}:8080"
+    networks:
+      - iot-network
+
+  # ==========================================
+  # MINIO - Data Lake (destino del streaming)
+  # ==========================================
+  minio:
+    image: minio/minio:latest
+    container_name: iot-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-admin123}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    networks:
+      - iot-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - minio-data:/data
+
+  # ==========================================
+  # MINIO INIT - crea los buckets raw-data / processed
+  # (mismos nombres que el material del curso)
+  # ==========================================
+  minio-init:
+    image: minio/mc:latest
+    container_name: iot-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-admin} ${MINIO_ROOT_PASSWORD:-admin123};
+      mc mb --ignore-existing local/raw-data;
+      mc mb --ignore-existing local/processed;
+      echo '✅ Buckets creados: raw-data, processed';
+      exit 0;
+      "
+    networks:
+      - iot-network
+
+  # ==========================================
+  # BRIDGE - suscriptor MQTT (HiveMQ) → productor Kafka
+  # ==========================================
+  bridge:
+    build:
+      context: ./bridge
+    image: iot-bridge:latest
+    container_name: iot-bridge
+    depends_on:
+      kafka:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    networks:
+      - iot-network
+    restart: unless-stopped
+
+  # ==========================================
+  # SPARK - Structured Streaming: Kafka → MinIO (Parquet)
+  # Descarga los conectores (Kafka, S3A) la primera vez vía --packages
+  # ==========================================
+  spark:
+    image: apache/spark:4.1.1
+    container_name: iot-spark
+    user: root   # el volumen de la caché ivy pertenece a root
+    depends_on:
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[*]
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.13:4.1.1,org.apache.hadoop:hadoop-aws:3.4.1
+      - --conf
+      - spark.jars.ivy=/tmp/ivy
+      - /app/streaming_job.py
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-iot-sensor}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-admin123}
+    volumes:
+      - ./spark:/app:ro
+      - spark-ivy:/tmp/ivy
+    networks:
+      - iot-network
+    restart: unless-stopped
+
+# ============================================
+# VOLÚMENES
+# ============================================
+volumes:
+  kafka-data:
+  minio-data:
+  spark-ivy:   # caché de los jars descargados (solo tarda la 1ª vez)
+
+# ============================================
+# RED
+# ============================================
+networks:
+  iot-network:
+    driver: bridge
+    name: iot-network

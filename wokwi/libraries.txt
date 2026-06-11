@@ -1,0 +1,3 @@
+# Librerías que Wokwi instala automáticamente para el sketch
+DHT sensor library for ESPx
+PubSubClient

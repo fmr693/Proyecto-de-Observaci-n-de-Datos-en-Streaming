@@ -1,0 +1,29 @@
+# ============================================
+# .gitignore - Proyecto Medallón AEMET
+# ============================================
+
+# Variables de entorno (contiene API keys y credenciales)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+*.egg
+
+# VS Code
+.vscode/
+
+# Docker volumes (datos persistentes)
+data/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS
+Thumbs.db
+.DS_Store
+*.swp
+*.swo
